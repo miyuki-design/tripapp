@@ -259,50 +259,126 @@ function loadDark(): boolean {
 
 interface MapViewProps {
   baseLat: number; baseLng: number
+  stationLat: number | null; stationLng: number | null; stationName: string
   spots: Place[]; foods: Place[]
-  favorites: Set<string>; dark: boolean
+  favorites: Set<string>
+  radiusM: number
+  onSelectPlace: (p: Place | null) => void
+  selectedId: string | null
 }
 
-function MapView({ baseLat, baseLng, spots, foods, favorites, dark }: MapViewProps) {
+function MapView({ baseLat, baseLng, stationLat, stationLng, stationName, spots, foods, favorites, radiusM, onSelectPlace, selectedId }: MapViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
+  const markersRef = useRef<Map<string, L.Marker>>(new Map())
+  const allPlaces = [...spots, ...foods]
+
+  // Rebuild marker icons when favorites change
+  const refreshMarkerIcons = useCallback((fav: Set<string>) => {
+    markersRef.current.forEach((marker, id) => {
+      const place = allPlaces.find(p => p.id === id)
+      if (!place) return
+      const isFav = fav.has(id)
+      const bg = isFav ? '#c85c2e' : (place.kind === 'spot' ? '#1a2e4a' : '#2d6a4f')
+      const radius = place.kind === 'spot' ? '50%' : '10px'
+      marker.setIcon(L.divIcon({
+        className: '',
+        html: `<div style="width:36px;height:36px;border-radius:${radius};background:${bg};border:2.5px solid white;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 8px rgba(0,0,0,0.3)">${place.emoji}</div>`,
+        iconSize: [36, 36], iconAnchor: [18, 18],
+      }))
+    })
+  }, [allPlaces])
+
+  useEffect(() => {
+    refreshMarkerIcons(favorites)
+  }, [favorites, refreshMarkerIcons])
 
   useEffect(() => {
     if (!containerRef.current || mapRef.current) return
-    const map = L.map(containerRef.current, { zoomControl: true, attributionControl: false }).setView([baseLat, baseLng], 15)
+    const map = L.map(containerRef.current, { zoomControl: false, attributionControl: false }).setView([baseLat, baseLng], 15)
     mapRef.current = map
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map)
 
-    // Current location
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map)
+    L.control.zoom({ position: 'bottomright' }).addTo(map)
+    L.control.attribution({ prefix: '© OpenStreetMap' }).addTo(map)
+
+    // Walking radius circle (subtle)
+    L.circle([baseLat, baseLng], {
+      radius: radiusM,
+      color: '#c85c2e',
+      weight: 1.5,
+      opacity: 0.35,
+      fillColor: '#c85c2e',
+      fillOpacity: 0.05,
+      dashArray: '6 4',
+    }).addTo(map)
+
+    // Current location pin
     L.marker([baseLat, baseLng], {
       icon: L.divIcon({
         className: '',
-        html: `<div style="width:18px;height:18px;border-radius:50%;background:#c85c2e;border:3px solid white;box-shadow:0 0 0 5px rgba(200,92,46,0.25)"></div>`,
-        iconSize: [18, 18], iconAnchor: [9, 9],
+        html: `<div style="position:relative;width:22px;height:22px">
+          <div style="position:absolute;inset:0;border-radius:50%;background:rgba(200,92,46,0.2);animation:ping 2s cubic-bezier(0,0,0.2,1) infinite"></div>
+          <div style="position:absolute;inset:3px;border-radius:50%;background:#c85c2e;border:2.5px solid white;box-shadow:0 2px 6px rgba(0,0,0,0.3)"></div>
+        </div>`,
+        iconSize: [22, 22], iconAnchor: [11, 11],
       }),
-    }).addTo(map).bindPopup('<b>現在地</b>')
+      zIndexOffset: 1000,
+    }).addTo(map)
 
-    const addPin = (p: Place, shape: 'circle' | 'square') => {
+    // Station pin
+    if (stationLat != null && stationLng != null) {
+      L.marker([stationLat, stationLng], {
+        icon: L.divIcon({
+          className: '',
+          html: `<div style="background:#1a2e4a;border:2.5px solid white;border-radius:8px;padding:3px 7px;font-size:11px;font-weight:700;color:white;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.3);font-family:'Noto Sans JP',sans-serif">🚉 ${stationName}</div>`,
+          iconAnchor: [0, 12],
+        }),
+        zIndexOffset: 900,
+      }).addTo(map)
+    }
+
+    // Place pins
+    const markers = new Map<string, L.Marker>()
+    const addPin = (p: Place) => {
       const isFav = favorites.has(p.id)
       const bg = isFav ? '#c85c2e' : (p.kind === 'spot' ? '#1a2e4a' : '#2d6a4f')
-      const radius = shape === 'circle' ? '50%' : '10px'
+      const radius = p.kind === 'spot' ? '50%' : '10px'
       const icon = L.divIcon({
         className: '',
         html: `<div style="width:36px;height:36px;border-radius:${radius};background:${bg};border:2.5px solid white;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 8px rgba(0,0,0,0.3)">${p.emoji}</div>`,
         iconSize: [36, 36], iconAnchor: [18, 18],
       })
-      const cuisine = p.tags.cuisine ? `<br><span style="color:#888;font-size:11px">${p.tags.cuisine}</span>` : ''
-      L.marker([p.lat, p.lng], { icon }).addTo(map).bindPopup(`<b>${p.name}</b>${cuisine}<br>🚶 徒歩${p.walkMin}分`)
+      const marker = L.marker([p.lat, p.lng], { icon }).addTo(map)
+      marker.on('click', () => onSelectPlace(p))
+      markers.set(p.id, marker)
+    }
+    allPlaces.forEach(addPin)
+    markersRef.current = markers
+
+    // Fit bounds to all points
+    const coords: [number, number][] = [
+      [baseLat, baseLng],
+      ...(stationLat != null && stationLng != null ? [[stationLat, stationLng] as [number, number]] : []),
+      ...allPlaces.map(p => [p.lat, p.lng] as [number, number]),
+    ]
+    if (coords.length > 1) {
+      map.fitBounds(L.latLngBounds(coords).pad(0.15))
     }
 
-    spots.forEach(p => addPin(p, 'circle'))
-    foods.forEach(p => addPin(p, 'square'))
-    L.control.attribution({ prefix: '© OpenStreetMap contributors' }).addTo(map)
+    // Tap map background to deselect
+    map.on('click', () => onSelectPlace(null))
 
-    return () => { map.remove(); mapRef.current = null }
+    return () => { map.remove(); mapRef.current = null; markersRef.current = new Map() }
   }, [])
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+}
+
+// CSS ping animation injected once
+const pingStyle = `@keyframes ping{75%,100%{transform:scale(2);opacity:0}}`
+if (!document.getElementById('map-ping-style')) {
+  const s = document.createElement('style'); s.id = 'map-ping-style'; s.textContent = pingStyle; document.head.appendChild(s)
 }
 
 // ── Place card ────────────────────────────────────────────────────────────────
@@ -450,14 +526,14 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
         {/* 現在地 */}
         <section>
           <label className="block text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: 'var(--muted-foreground)' }}>現在地</label>
-          <div className="flex gap-2">
-            <input type="text" placeholder="例：新宿区、金沢市、松本市..." value={location}
+          <div className="flex gap-2 min-w-0">
+            <input type="text" placeholder="例：新宿区、金沢市..." value={location}
               onChange={e => { setLocation(e.target.value); setErrors(p => ({ ...p, location: '' })) }}
-              className="flex-1 px-4 py-3 text-sm rounded-xl outline-none"
+              className="min-w-0 flex-1 px-3 py-3 text-sm rounded-xl outline-none"
               style={{ background: 'var(--card)', border: `1.5px solid ${errors.location ? 'var(--accent)' : 'var(--border)'}`, color: 'var(--foreground)' }}
             />
-            <button onClick={handleGps} disabled={gpsLoading} className="px-3 py-3 rounded-xl text-sm font-medium flex items-center gap-1 active:scale-95" style={{ background: 'var(--primary)', color: 'var(--primary-foreground)', minWidth: 72 }}>
-              {gpsLoading ? <span className="animate-spin inline-block">⟳</span> : <><span>📍</span><span>取得</span></>}
+            <button onClick={handleGps} disabled={gpsLoading} className="shrink-0 w-11 h-11 rounded-xl text-lg flex items-center justify-center active:scale-95" style={{ background: 'var(--primary)', color: 'var(--primary-foreground)' }}>
+              {gpsLoading ? <span className="animate-spin inline-block">⟳</span> : <span>📍</span>}
             </button>
           </div>
           {locationLat && <p className="text-xs mt-1.5" style={{ color: 'var(--muted-foreground)' }}>✓ GPS取得済み ({locationLat.toFixed(4)}, {locationLng?.toFixed(4)})</p>}
@@ -626,6 +702,9 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
   const [foodState, setFoodState] = useState<FetchState>('idle')
   const [activeTab, setActiveTab] = useState<'spots' | 'food' | 'map' | 'favs'>('spots')
   const [favorites, setFavorites] = useState<Set<string>>(loadFavs)
+  const [selectedPlace, setSelectedPlace] = useState<Place | null>(null)
+  const [stationLat, setStationLat] = useState<number | null>(null)
+  const [stationLng, setStationLng] = useState<number | null>(null)
 
   useEffect(() => {
     setSpotState('loading')
@@ -647,6 +726,17 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
       })
       .catch(() => setFoodState('error'))
   }, [baseLat, baseLng, radiusM])
+
+  // Geocode station name once
+  useEffect(() => {
+    if (!data.station) return
+    fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(data.station)}&format=json&limit=1&accept-language=ja&countrycodes=jp`)
+      .then(r => r.json())
+      .then(results => {
+        if (results[0]) { setStationLat(parseFloat(results[0].lat)); setStationLng(parseFloat(results[0].lon)) }
+      })
+      .catch(() => {})
+  }, [data.station])
 
   const toggleFav = useCallback((id: string) => {
     setFavorites(prev => {
@@ -728,14 +818,80 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
 
       {/* Map */}
       {activeTab === 'map' && (
-        <div className="flex-1 relative" style={{ minHeight: 420 }}>
-          <MapView baseLat={baseLat} baseLng={baseLng} spots={spots} foods={foods} favorites={favorites} dark={dark} />
-          <div className="absolute bottom-4 left-4 right-4 rounded-xl px-4 py-3 z-[1000]" style={{ background: 'var(--card)', border: '1.5px solid var(--border)', boxShadow: '0 4px 20px rgba(0,0,0,0.15)' }}>
-            <div className="flex gap-4 text-xs" style={{ color: 'var(--muted-foreground)' }}>
-              <span className="flex items-center gap-1.5"><span style={{ width: 12, height: 12, borderRadius: '50%', background: '#1a2e4a', display: 'inline-block' }} />スポット</span>
-              <span className="flex items-center gap-1.5"><span style={{ width: 12, height: 12, borderRadius: 3, background: '#2d6a4f', display: 'inline-block' }} />食事</span>
-              <span className="flex items-center gap-1.5"><span style={{ width: 12, height: 12, borderRadius: '50%', background: '#c85c2e', display: 'inline-block' }} />お気に入り</span>
+        <div className="flex-1 flex flex-col" style={{ minHeight: 0, position: 'relative' }}>
+          {/* Map time limit banner */}
+          <div className="flex items-center justify-between px-4 py-2.5 z-10 shrink-0" style={{ background: 'var(--primary)', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
+            <div className="flex items-center gap-2 text-xs" style={{ color: 'rgba(245,240,232,0.7)' }}>
+              <span className="flex items-center gap-1.5"><span style={{ width: 10, height: 10, borderRadius: '50%', background: '#c85c2e', display: 'inline-block' }} />現在地</span>
+              <span className="flex items-center gap-1.5"><span style={{ width: 10, height: 10, borderRadius: '50%', background: '#1a2e4a', display: 'inline-block' }} />スポット</span>
+              <span className="flex items-center gap-1.5"><span style={{ width: 10, height: 10, borderRadius: 3, background: '#2d6a4f', display: 'inline-block' }} />食事</span>
             </div>
+            <div className="text-right">
+              <span className="text-xs font-bold px-2.5 py-1 rounded-full" style={{ background: 'rgba(200,92,46,0.35)', color: '#f5a880' }}>
+                ⏱️ {minutesToTime(availableUntilMin)}までに駅へ
+              </span>
+            </div>
+          </div>
+
+          {/* Map canvas */}
+          <div className="flex-1 relative" style={{ minHeight: 320 }}>
+            <MapView
+              baseLat={baseLat} baseLng={baseLng}
+              stationLat={stationLat} stationLng={stationLng} stationName={data.station}
+              spots={spots} foods={foods}
+              favorites={favorites}
+              radiusM={radiusM}
+              onSelectPlace={setSelectedPlace}
+              selectedId={selectedPlace?.id ?? null}
+            />
+          </div>
+
+          {/* Bottom place card (tap-to-show) */}
+          <div
+            className="shrink-0 transition-all duration-300"
+            style={{
+              maxHeight: selectedPlace ? 200 : 0,
+              overflow: 'hidden',
+              background: 'var(--card)',
+              borderTop: '1.5px solid var(--border)',
+              boxShadow: selectedPlace ? '0 -4px 20px rgba(0,0,0,0.12)' : 'none',
+            }}
+          >
+            {selectedPlace && (
+              <div className="px-4 py-4 relative">
+                <div className="flex items-start gap-3">
+                  <div className="text-2xl w-11 h-11 flex items-center justify-center rounded-xl shrink-0" style={{ background: 'var(--muted)' }}>
+                    {selectedPlace.emoji}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-start justify-between gap-2 mb-0.5">
+                      <span className="font-semibold text-sm leading-snug" style={{ color: 'var(--foreground)' }}>{selectedPlace.name}</span>
+                      <button
+                        onClick={() => toggleFav(selectedPlace.id)}
+                        className="text-lg shrink-0 active:scale-90 transition-all"
+                      >
+                        {favorites.has(selectedPlace.id) ? '❤️' : '🤍'}
+                      </button>
+                    </div>
+                    {selectedPlace.subtitle && (
+                      <p className="text-xs mb-1.5" style={{ color: 'var(--accent)' }}>{selectedPlace.subtitle}</p>
+                    )}
+                    <div className="flex items-center gap-3 text-xs flex-wrap" style={{ color: 'var(--muted-foreground)' }}>
+                      <span>🚶 徒歩{selectedPlace.walkMin}分</span>
+                      <span>🔄 往復{selectedPlace.walkMin * 2}分〜</span>
+                      <span style={{ color: 'var(--foreground)', fontWeight: 500 }}>
+                        {selectedPlace.kind === 'spot' ? '寄り道スポット' : '飲食店'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setSelectedPlace(null)}
+                  className="absolute top-3 right-3 text-xs px-2 py-1 rounded-lg"
+                  style={{ color: 'var(--muted-foreground)', background: 'var(--muted)' }}
+                >✕</button>
+              </div>
+            )}
           </div>
         </div>
       )}
