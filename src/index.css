@@ -1,0 +1,126 @@
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;600;700&family=Outfit:wght@400;500;600;700&display=swap');
+@import 'tailwindcss';
+@import 'leaflet/dist/leaflet.css';
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+}
+
+:root {
+  --background: #f5f0e8;
+  --foreground: #1c1a16;
+  --card: #fffdf8;
+  --card-foreground: #1c1a16;
+  --primary: #1a2e4a;
+  --primary-foreground: #f5f0e8;
+  --secondary: #e8e0d4;
+  --secondary-foreground: #1c1a16;
+  --muted: #ede8df;
+  --muted-foreground: #6b6457;
+  --accent: #c85c2e;
+  --accent-foreground: #fffdf8;
+  --border: #d4cbbf;
+  --ring: #c85c2e;
+  --radius: 12px;
+
+  color-scheme: light;
+}
+
+.dark {
+  --background: #111318;
+  --foreground: #e8e4dc;
+  --card: #1c2029;
+  --card-foreground: #e8e4dc;
+  --primary: #0f1927;
+  --primary-foreground: #e8e4dc;
+  --secondary: #232835;
+  --secondary-foreground: #e8e4dc;
+  --muted: #1a1f2c;
+  --muted-foreground: #8a8278;
+  --accent: #d96535;
+  --accent-foreground: #fffdf8;
+  --border: #2a2f3c;
+  --ring: #d96535;
+
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: 'Noto Sans JP', 'Outfit', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+  transition: background 0.25s, color 0.25s;
+}
+
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+input, select, textarea {
+  font-family: inherit;
+}
+
+/* Leaflet dark mode tile filter */
+.dark .leaflet-tile {
+  filter: brightness(0.65) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7);
+}
+
+.dark .leaflet-container {
+  background: #1a1f2c;
+}
+
+/* Leaflet popup dark mode */
+.dark .leaflet-popup-content-wrapper {
+  background: var(--card);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+}
+
+.dark .leaflet-popup-tip {
+  background: var(--card);
+}
+
+.leaflet-popup-content-wrapper {
+  border-radius: 12px !important;
+  padding: 0 !important;
+}
+
+.leaflet-popup-content {
+  margin: 12px 14px !important;
+  font-family: 'Noto Sans JP', sans-serif;
+  font-size: 13px;
+}
+
+.spot-marker-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  line-height: 1;
+}
