@@ -369,6 +369,9 @@ function MapView({ baseLat, baseLng, stationLat, stationLng, stationName, spots,
     // Tap map background to deselect
     map.on('click', () => onSelectPlace(null))
 
+    // Ensure Leaflet recalculates size after layout settles
+    setTimeout(() => map.invalidateSize(), 50)
+
     return () => { map.remove(); mapRef.current = null; markersRef.current = new Map() }
   }, [])
 
@@ -834,7 +837,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
           </div>
 
           {/* Map canvas */}
-          <div className="flex-1 relative" style={{ minHeight: 320 }}>
+          <div className="flex-1 relative" style={{ minHeight: 320, height: 'calc(100vh - 280px)' }}>
             <MapView
               baseLat={baseLat} baseLng={baseLng}
               stationLat={stationLat} stationLng={stationLng} stationName={data.station}
