@@ -1,0 +1,10 @@
+{
+  "description": "Provides personalized nearby dining and sightseeing recommendations based on your location, business trip schedule, and train times to optimize your travel breaks.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
