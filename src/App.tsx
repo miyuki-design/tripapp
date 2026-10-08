@@ -313,7 +313,7 @@ function MapView({ baseLat, baseLng, stationLat, stationLng, stationName, spots,
       dashArray: '6 4',
     }).addTo(map)
 
-    // Current location pin
+    // Selected starting-point pin
     L.marker([baseLat, baseLng], {
       icon: L.divIcon({
         className: '',
@@ -441,6 +441,37 @@ function Empty({ message }: { message: string }) {
   )
 }
 
+// ── Location search (Photon / OpenStreetMap) ───────────────────────────────────
+// 住所・施設名の入力候補は、入力後にPhotonで検索する。
+// Nominatimの公開APIはオートコンプリートを禁止しているため、候補表示には使わない。
+interface LocationOption {
+  id: string
+  label: string
+  lat: number
+  lng: number
+}
+
+async function searchLocations(query: string, signal?: AbortSignal): Promise<LocationOption[]> {
+  const params = new URLSearchParams({ q: query.trim(), lang: 'ja', limit: '6' })
+  const response = await fetch(`https://photon.komoot.io/api/?${params.toString()}`, { signal })
+  if (!response.ok) throw new Error(`場所の検索に失敗しました (${response.status})`)
+  const result = await response.json()
+  const features: any[] = Array.isArray(result.features) ? result.features : []
+
+  return features.flatMap((feature: any, index: number): LocationOption[] => {
+    const coords = feature.geometry?.coordinates
+    if (!Array.isArray(coords) || coords.length < 2) return []
+    const lng = Number(coords[0])
+    const lat = Number(coords[1])
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return []
+    const props = feature.properties ?? {}
+    const parts: string[] = [props.name, props.street, props.city || props.town, props.county, props.state]
+      .filter((v: unknown): v is string => typeof v === 'string' && v.trim().length > 0)
+    const label = [...new Set(parts)].join('、') || query.trim()
+    return [{ id: `${lat}:${lng}:${index}`, label, lat, lng }]
+  })
+}
+
 // ── Input Page ────────────────────────────────────────────────────────────────
 
 function InputPage({ onSubmit, dark, onToggleDark }: {
@@ -463,25 +494,126 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
   const [gpsLoading, setGpsLoading] = useState(false)
   const [gpsError, setGpsError] = useState('')
   const [errors, setErrors] = useState<Record<string, string>>({})
+  const [locationSource, setLocationSource] = useState<'gps' | 'manual' | null>(null)
+  const [locationOptions, setLocationOptions] = useState<LocationOption[]>([])
+  const [locationSearching, setLocationSearching] = useState(false)
+  const [locationSearchError, setLocationSearchError] = useState('')
+  const [locationResolving, setLocationResolving] = useState(false)
+  const locationChangeRef = useRef(0)
+
+  // 候補は入力が止まってから表示。古いリクエストは破棄する。
+  // 住所・施設名の候補表示にはPhotonを使用（Nominatimには連続照会しない）。
+  useEffect(() => {
+    if (locationSource !== null || location.trim().length < 2) {
+      setLocationOptions([])
+      setLocationSearching(false)
+      return
+    }
+    const controller = new AbortController()
+    let active = true
+    const timer = window.setTimeout(async () => {
+      setLocationSearching(true)
+      setLocationSearchError('')
+      try {
+        const options = await searchLocations(location, controller.signal)
+        if (active) setLocationOptions(options)
+      } catch (err) {
+        if (active && !controller.signal.aborted) {
+          setLocationSearchError('候補を取得できませんでした。場所名を確認してください')
+          setLocationOptions([])
+        }
+      } finally {
+        if (active) setLocationSearching(false)
+      }
+    }, 650)
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+      controller.abort()
+    }
+  }, [location, locationSource])
+
+  const handleLocationChange = (value: string) => {
+    locationChangeRef.current++
+    setLocation(value)
+    // GPSで選んだ後に書き換えたら、古い座標を絶対に流用しない。
+    setLocationLat(null)
+    setLocationLng(null)
+    setLocationSource(null)
+    setLocationOptions([])
+    setLocationSearchError('')
+    setGpsError('')
+    setGpsLoading(false)
+    setErrors(prev => ({ ...prev, location: '' }))
+  }
+
+  const handleLocationSelect = (option: LocationOption) => {
+    locationChangeRef.current++
+    setLocation(option.label)
+    setLocationLat(option.lat)
+    setLocationLng(option.lng)
+    setLocationSource('manual')
+    setLocationOptions([])
+    setLocationSearchError('')
+    setGpsError('')
+    setErrors(prev => ({ ...prev, location: '' }))
+  }
+
 
   const handleGps = () => {
-    if (!navigator.geolocation) { setGpsError('位置情報に対応していません'); return }
-    setGpsLoading(true); setGpsError('')
+    if (!navigator.geolocation) {
+      setGpsError('この端末は位置情報の取得に対応していません。手動で入力してください')
+      return
+    }
+    const requestId = ++locationChangeRef.current
+    setGpsLoading(true)
+    setGpsError('')
+    setLocationSearchError('')
+    setLocationOptions([])
+    setLocationLat(null)
+    setLocationLng(null)
+    setLocationSource('gps')
+
     navigator.geolocation.getCurrentPosition(
-      pos => {
-        setLocationLat(pos.coords.latitude); setLocationLng(pos.coords.longitude)
-        fetch(`https://nominatim.openstreetmap.org/reverse?lat=${pos.coords.latitude}&lon=${pos.coords.longitude}&format=json&accept-language=ja`)
-          .then(r => r.json())
-          .then(d => {
-            const a = d.address
-            const parts = [a.city || a.town || a.village || a.hamlet, a.state].filter(Boolean)
-            setLocation(parts.join('、') || `${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`)
-          })
-          .catch(() => setLocation(`${pos.coords.latitude.toFixed(4)}, ${pos.coords.longitude.toFixed(4)}`))
-          .finally(() => setGpsLoading(false))
+      async pos => {
+        if (requestId !== locationChangeRef.current) return
+        const lat = pos.coords.latitude
+        const lng = pos.coords.longitude
+        const fallback = `${lat.toFixed(5)}, ${lng.toFixed(5)}`
+        setLocationLat(lat)
+        setLocationLng(lng)
+        setLocation(fallback)
+        setErrors(prev => ({ ...prev, location: '' }))
+        // 逆ジオコーディングはGPSボタン押下時の1回のみ。
+        try {
+          const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=ja`
+          const response = await fetch(url)
+          if (!response.ok) throw new Error('逆ジオコーディング失敗')
+          const data = await response.json()
+          if (requestId !== locationChangeRef.current) return
+          const a = data.address ?? {}
+          const parts = [
+            a.road || a.suburb || a.neighbourhood || a.quarter || a.city_district,
+            a.city || a.town || a.village || a.hamlet || a.municipality || a.county,
+            a.state,
+          ].filter(Boolean)
+          setLocation([...new Set(parts)].join('、') || fallback)
+        } catch {
+          // 住所表示が取得できなくてもGPS座標自体は有効。
+          if (requestId === locationChangeRef.current) setLocation(fallback)
+        } finally {
+          if (requestId === locationChangeRef.current) setGpsLoading(false)
+        }
       },
-      () => { setGpsError('位置情報を取得できませんでした。手動で入力してください'); setGpsLoading(false) },
-      { timeout: 10000 }
+      err => {
+        if (requestId !== locationChangeRef.current) return
+        setGpsLoading(false)
+        setLocationSource(null)
+        setGpsError(err.code === 1
+          ? '位置情報が許可されていません。設定で許可するか、手動で入力してください'
+          : '位置情報を取得できませんでした。手動で入力してください')
+      },
+      { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 }
     )
   }
 
@@ -494,10 +626,47 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
     return e
   }
 
-  const handleSubmit = () => {
+  const handleSubmit = async () => {
+    if (gpsLoading || locationResolving) return
     const e = validate()
     if (Object.keys(e).length > 0) { setErrors(e); return }
-    onSubmit({ location, locationLat, locationLng, tripStart, tripEnd, station, boardingTime, margin })
+
+    let lat = locationLat
+    let lng = locationLng
+    let label = location
+
+    // 候補をタップせずそのまま進んだ場合も、必ず場所名→座標に変換する。
+    // 変換できない場所名で東京を代用することはしない。
+    if (lat === null || lng === null) {
+      const requestId = locationChangeRef.current
+      setLocationResolving(true)
+      setErrors(prev => ({ ...prev, location: '' }))
+      try {
+        const matches = await searchLocations(location)
+        if (requestId !== locationChangeRef.current) return
+        if (!matches.length) {
+          setErrors(prev => ({ ...prev, location: '場所を特定できませんでした。住所や駅名を詳しく入力してください' }))
+          return
+        }
+        const chosen = matches[0]
+        lat = chosen.lat
+        lng = chosen.lng
+        label = chosen.label
+        setLocation(chosen.label)
+        setLocationLat(lat)
+        setLocationLng(lng)
+        setLocationSource('manual')
+        setLocationOptions([])
+      } catch {
+        if (requestId === locationChangeRef.current) {
+          setErrors(prev => ({ ...prev, location: '位置検索に失敗しました。通信状況を確認して再試行してください' }))
+        }
+        return
+      } finally {
+        setLocationResolving(false)
+      }
+    }
+    onSubmit({ location: label, locationLat: lat, locationLng: lng, tripStart, tripEnd, station, boardingTime, margin })
   }
 
   const availableUntilMin = timeToMinutes(boardingTime) - margin
@@ -526,22 +695,56 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
       </div>
 
       <div className="flex-1 px-4 py-5 space-y-5 pb-10">
-        {/* 現在地 */}
+        {/* 現在地・出張先 */}
         <section>
-          <label className="block text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: 'var(--muted-foreground)' }}>現在地</label>
+          <label htmlFor="location-input" className="block text-xs font-semibold uppercase tracking-widest mb-2" style={{ color: 'var(--muted-foreground)' }}>
+            現在地・出張先
+          </label>
           <div className="flex gap-2 min-w-0">
-            <input type="text" placeholder="例：新宿区、金沢市..." value={location}
-              onChange={e => { setLocation(e.target.value); setErrors(p => ({ ...p, location: '' })) }}
+            <input id="location-input" type="search" autoComplete="off"
+              placeholder="住所・施設・駅を入力（例：松本市役所）"
+              value={location} onChange={e => handleLocationChange(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Escape') setLocationOptions([]) }}
               className="min-w-0 flex-1 px-3 py-3 text-sm rounded-xl outline-none"
               style={{ background: 'var(--card)', border: `1.5px solid ${errors.location ? 'var(--accent)' : 'var(--border)'}`, color: 'var(--foreground)' }}
+              aria-label="住所、施設名、駅名を入力"
             />
-            <button onClick={handleGps} disabled={gpsLoading} className="shrink-0 w-11 h-11 rounded-xl text-lg flex items-center justify-center active:scale-95" style={{ background: 'var(--primary)', color: 'var(--primary-foreground)' }}>
+            <button type="button" onClick={handleGps} disabled={gpsLoading}
+              aria-label="GPSで現在地を取得" title="GPSで現在地を取得"
+              className="shrink-0 w-11 h-11 rounded-xl text-lg flex items-center justify-center active:scale-95 disabled:opacity-50"
+              style={{ background: 'var(--primary)', color: 'var(--primary-foreground)' }}>
               {gpsLoading ? <span className="animate-spin inline-block">⟳</span> : <span>📍</span>}
             </button>
           </div>
-          {locationLat && <p className="text-xs mt-1.5" style={{ color: 'var(--muted-foreground)' }}>✓ GPS取得済み ({locationLat.toFixed(4)}, {locationLng?.toFixed(4)})</p>}
+          <p className="text-xs mt-1.5" style={{ color: 'var(--muted-foreground)' }}>
+            📍 GPSを使うか、場所名から候補を選んでください
+          </p>
+          {locationSource === null && location.trim().length >= 2 && (
+            <div className="mt-2 rounded-xl overflow-hidden" style={{ border: '1px solid var(--border)', background: 'var(--card)' }}>
+              {locationSearching && <p className="text-xs px-3 py-3" style={{ color: 'var(--muted-foreground)' }}>🔎 場所を検索中...</p>}
+              {!locationSearching && locationOptions.map(option => (
+                <button type="button" key={option.id}
+                  onClick={() => handleLocationSelect(option)}
+                  className="w-full text-left px-3 py-3 text-sm active:opacity-70"
+                  style={{ color: 'var(--foreground)', borderBottom: '1px solid var(--border)' }}>
+                  📍 {option.label}
+                </button>
+              ))}
+              {!locationSearching && !locationSearchError && locationOptions.length === 0 && (
+                <p className="px-3 py-2 text-xs" style={{ color: 'var(--muted-foreground)' }}>
+                  候補が出ない場合はそのまま「寄り道スポットを探す」を押せます
+                </p>
+              )}
+            </div>
+          )}
+          {locationLat !== null && locationLng !== null && (
+            <p className="text-xs mt-1.5" style={{ color: 'var(--muted-foreground)' }}>
+              ✓ {locationSource === 'gps' ? 'GPS取得済み' : '場所を指定済み'}（{locationLat.toFixed(4)}, {locationLng.toFixed(4)}）
+            </p>
+          )}
+          {locationSearchError && <p className="text-xs mt-1.5" style={{ color: 'var(--accent)' }}>{locationSearchError}</p>}
           {gpsError && <p className="text-xs mt-1.5" style={{ color: 'var(--accent)' }}>{gpsError}</p>}
-          {errors.location && <p className="text-xs mt-1.5" style={{ color: 'var(--accent)' }}>{errors.location}</p>}
+          {errors.location && <p className="text-xs mt-1.5" role="alert" style={{ color: 'var(--accent)' }}>{errors.location}</p>}
         </section>
 
         {/* 出張時間 */}
@@ -671,8 +874,10 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
           </div>
         </section>
 
-        <button onClick={handleSubmit} className="w-full py-4 rounded-xl text-base font-bold tracking-wide active:scale-95" style={{ background: 'var(--accent)', color: 'var(--accent-foreground)' }}>
-          寄り道スポットを探す →
+        <button onClick={handleSubmit} disabled={gpsLoading || locationResolving}
+          className="w-full py-4 rounded-xl text-base font-bold tracking-wide active:scale-95 disabled:opacity-50"
+          style={{ background: 'var(--accent)', color: 'var(--accent-foreground)' }}>
+          {locationResolving ? '🔎 場所を確認中...' : gpsLoading ? '📍 現在地を取得中...' : '寄り道スポットを探す →'}
         </button>
       </div>
     </div>
@@ -696,8 +901,9 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
   // Approx radius: 80 m/min * maxWalkMin (capped at 1500m, min 400m)
   const radiusM = Math.min(1500, Math.max(400, maxWalkMin * 80))
 
-  const baseLat = data.locationLat ?? 35.6895
-  const baseLng = data.locationLng ?? 139.6917
+  // InputPageで座標確定後にだけ遷移する。入力した場所を東京に置換しない。
+  const baseLat = data.locationLat!
+  const baseLng = data.locationLng!
 
   const [spots, setSpots] = useState<Place[]>([])
   const [foods, setFoods] = useState<Place[]>([])
@@ -825,7 +1031,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
           {/* Map time limit banner */}
           <div className="flex items-center justify-between px-4 py-2.5 z-10 shrink-0" style={{ background: 'var(--primary)', borderBottom: '1px solid rgba(255,255,255,0.08)' }}>
             <div className="flex items-center gap-2 text-xs" style={{ color: 'rgba(245,240,232,0.7)' }}>
-              <span className="flex items-center gap-1.5"><span style={{ width: 10, height: 10, borderRadius: '50%', background: '#c85c2e', display: 'inline-block' }} />現在地</span>
+              <span className="flex items-center gap-1.5"><span style={{ width: 10, height: 10, borderRadius: '50%', background: '#c85c2e', display: 'inline-block' }} />指定場所</span>
               <span className="flex items-center gap-1.5"><span style={{ width: 10, height: 10, borderRadius: '50%', background: '#1a2e4a', display: 'inline-block' }} />スポット</span>
               <span className="flex items-center gap-1.5"><span style={{ width: 10, height: 10, borderRadius: 3, background: '#2d6a4f', display: 'inline-block' }} />食事</span>
             </div>
