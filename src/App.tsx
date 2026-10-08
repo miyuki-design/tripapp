@@ -452,7 +452,7 @@ interface LocationOption {
 }
 
 async function searchLocations(query: string, signal?: AbortSignal): Promise<LocationOption[]> {
-  const params = new URLSearchParams({ q: query.trim(), lang: 'ja', limit: '6' })
+  const params = new URLSearchParams({ q: query.trim(), lang: 'default', limit: '6' })
   const response = await fetch(`https://photon.komoot.io/api/?${params.toString()}`, { signal })
   if (!response.ok) throw new Error(`場所の検索に失敗しました (${response.status})`)
   const result = await response.json()
@@ -519,7 +519,7 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
         if (active) setLocationOptions(options)
       } catch (err) {
         if (active && !controller.signal.aborted) {
-          setLocationSearchError('候補を取得できませんでした。場所名を確認してください')
+          setLocationSearchError('場所検索サービスに接続できませんでした。時間をおいて再試行してください')
           setLocationOptions([])
         }
       } finally {
