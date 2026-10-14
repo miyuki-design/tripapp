@@ -414,6 +414,31 @@ if (!document.getElementById('map-ping-style')) {
   const s = document.createElement('style'); s.id = 'map-ping-style'; s.textContent = pingStyle; document.head.appendChild(s)
 }
 
+// ── Walking directions ──────────────────────────────────────────────────────
+// Open a real pedestrian route in an external map (no map API key required).
+// No origin is specified so the map can use the device's current location.
+function WalkingDirections({ lat, lng, compact = false }: { lat: number; lng: number; compact?: boolean }) {
+  const destination = encodeURIComponent(`${lat},${lng}`)
+  const appleUrl = `https://maps.apple.com/?daddr=${destination}&dirflg=w`
+  const googleUrl = `https://www.google.com/maps/dir/?api=1&destination=${destination}&travelmode=walking`
+
+  return (
+    <div className={`flex flex-wrap gap-2 ${compact ? 'mt-2' : 'mt-3 pt-3'}`}
+      style={compact ? undefined : { borderTop: '1px solid var(--border)' }}>
+      <a href={appleUrl} target="_blank" rel="noopener noreferrer"
+        className="inline-flex items-center justify-center px-3 py-2 rounded-lg text-xs font-semibold active:scale-95"
+        style={{ background: 'var(--primary)', color: 'var(--primary-foreground)' }}>
+        🚶 Appleマップで徒歩ナビ ↗
+      </a>
+      <a href={googleUrl} target="_blank" rel="noopener noreferrer"
+        className="inline-flex items-center justify-center px-3 py-2 rounded-lg text-xs font-medium active:scale-95"
+        style={{ background: 'var(--secondary)', color: 'var(--secondary-foreground)', border: '1px solid var(--border)' }}>
+        🗺️ Googleマップ ↗
+      </a>
+    </div>
+  )
+}
+
 // ── Place card ────────────────────────────────────────────────────────────────
 
 const TAG_COLORS = {
@@ -450,11 +475,12 @@ function PlaceCard({ place, isFav, onToggleFav, dark }: { place: Place; isFav: b
             <p className="text-xs mb-1.5 leading-relaxed" style={{ color: 'var(--muted-foreground)' }}>{place.tags['description:ja'] || place.tags.description}</p>
           )}
           <div className="flex items-center gap-3 text-xs" style={{ color: 'var(--muted-foreground)' }}>
-            <span>🚶 徒歩{place.walkMin}分</span>
+            <span>🚶 徒歩{place.walkMin}分（概算）</span>
             {place.kind === 'spot' && <span>⏱️ 往復{place.walkMin * 2}分〜</span>}
           </div>
         </div>
       </div>
+      <WalkingDirections lat={place.lat} lng={place.lng} />
     </div>
   )
 }
@@ -1113,7 +1139,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
           <div
             className="shrink-0 transition-all duration-300"
             style={{
-              maxHeight: selectedPlace ? 200 : 0,
+              maxHeight: selectedPlace ? 260 : 0,
               overflow: 'hidden',
               background: 'var(--card)',
               borderTop: '1.5px solid var(--border)',
@@ -1140,7 +1166,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
                       <p className="text-xs mb-1.5" style={{ color: 'var(--accent)' }}>{selectedPlace.subtitle}</p>
                     )}
                     <div className="flex items-center gap-3 text-xs flex-wrap" style={{ color: 'var(--muted-foreground)' }}>
-                      <span>🚶 徒歩{selectedPlace.walkMin}分</span>
+                      <span>🚶 徒歩{selectedPlace.walkMin}分（概算）</span>
                       <span>🔄 往復{selectedPlace.walkMin * 2}分〜</span>
                       <span style={{ color: 'var(--foreground)', fontWeight: 500 }}>
                         {selectedPlace.kind === 'spot' ? '寄り道スポット' : '飲食店'}
@@ -1148,6 +1174,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
                     </div>
                   </div>
                 </div>
+                <WalkingDirections lat={selectedPlace.lat} lng={selectedPlace.lng} compact />
                 <button
                   onClick={() => setSelectedPlace(null)}
                   className="absolute top-3 right-3 text-xs px-2 py-1 rounded-lg"
@@ -1205,6 +1232,9 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
         <div className="px-4 pb-8 pt-3" style={{ borderTop: '1px solid var(--border)', background: 'var(--background)' }}>
           <p className="text-center text-xs mb-3" style={{ color: 'var(--muted-foreground)' }}>
             🕐 {minutesToTime(availableUntilMin)} までに {data.station} へ出発
+          </p>
+          <p className="text-center text-xs mb-3" style={{ color: 'var(--muted-foreground)' }}>
+            ※ 徒歩時間は直線距離からの概算。実際の経路と所要時間は地図アプリでご確認ください。
           </p>
           <button onClick={onBack} className="w-full py-3 rounded-xl text-sm font-medium active:scale-95" style={{ background: 'var(--secondary)', color: 'var(--secondary-foreground)', border: '1.5px solid var(--border)' }}>
             条件を変更する
