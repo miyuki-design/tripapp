@@ -71,16 +71,46 @@ function walkMinutes(dist: number): number {
 // ── Overpass API ─────────────────────────────────────────────────────────────
 
 const OVERPASS_ENDPOINT = 'https://overpass-api.de/api/interpreter'
+const OVERPASS_RETRY_DELAYS_MS = [2000, 5000]
 
-async function fetchOverpass(query: string): Promise<any[]> {
-  const res = await fetch(OVERPASS_ENDPOINT, {
-    method: 'POST',
-    body: `data=${encodeURIComponent(query)}`,
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-  })
-  if (!res.ok) throw new Error(`Overpass ${res.status}`)
-  const json = await res.json()
-  return json.elements ?? []
+// Overpass is a shared service. Run one request at a time, including manual retries.
+let overpassQueue: Promise<void> = Promise.resolve()
+
+async function requestOverpassWithRetry(query: string): Promise<any[]> {
+  for (let attempt = 0; attempt <= OVERPASS_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      const res = await fetch(OVERPASS_ENDPOINT, {
+        method: 'POST',
+        body: `data=${encodeURIComponent(query)}`,
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      })
+      if (!res.ok) {
+        const error = new Error(`Overpass HTTP ${res.status}`)
+        // Bad requests, authorization errors, etc. will not improve with a retry.
+        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+          throw Object.assign(error, { nonRetryable: true })
+        }
+        throw error
+      }
+      const json = await res.json()
+      if (!Array.isArray(json.elements)) throw new Error('Overpass returned invalid data')
+      return json.elements
+    } catch (error) {
+      if ((error as { nonRetryable?: boolean })?.nonRetryable || attempt === OVERPASS_RETRY_DELAYS_MS.length) {
+        throw error
+      }
+      console.warn('Overpass: retrying after an error', error)
+      await new Promise<void>(resolve => setTimeout(resolve, OVERPASS_RETRY_DELAYS_MS[attempt]))
+    }
+  }
+  throw new Error('Overpass requests failed')
+}
+
+function fetchOverpass(query: string): Promise<any[]> {
+  const request = overpassQueue.then(() => requestOverpassWithRetry(query))
+  // Keep the queue usable even if one category's request fails.
+  overpassQueue = request.then(() => {}, () => {})
+  return request
 }
 
 function elementCoord(el: any): { lat: number; lng: number } | null {
@@ -431,12 +461,20 @@ function PlaceCard({ place, isFav, onToggleFav, dark }: { place: Place; isFav: b
 
 // ── Empty state ───────────────────────────────────────────────────────────────
 
-function Empty({ message }: { message: string }) {
+function Empty({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
     <div className="text-center py-14 px-4">
       <p className="text-4xl mb-3">🔍</p>
       <p className="text-sm font-medium mb-1" style={{ color: 'var(--foreground)' }}>{message}</p>
-      <p className="text-xs" style={{ color: 'var(--muted-foreground)' }}>エリアを変えるか、検索半径を広げてみてください</p>
+      <p className="text-xs" style={{ color: 'var(--muted-foreground)' }}>
+        {onRetry ? '一時的なエラーの可能性があります。少し待ってから再検索できます' : 'エリアを変えるか、検索半径を広げてみてください'}
+      </p>
+      {onRetry && (
+        <button type="button" onClick={onRetry} className="mt-5 px-5 py-2.5 rounded-xl text-sm font-semibold active:scale-95"
+          style={{ background: 'var(--secondary)', color: 'var(--secondary-foreground)', border: '1.5px solid var(--border)' }}>
+          🔄 この項目だけ再検索
+        </button>
+      )}
     </div>
   )
 }
@@ -909,6 +947,8 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
   const [foods, setFoods] = useState<Place[]>([])
   const [spotState, setSpotState] = useState<FetchState>('idle')
   const [foodState, setFoodState] = useState<FetchState>('idle')
+  const [spotRetryCount, setSpotRetryCount] = useState(0)
+  const [foodRetryCount, setFoodRetryCount] = useState(0)
   const [activeTab, setActiveTab] = useState<'spots' | 'food' | 'map' | 'favs'>('spots')
   const [favorites, setFavorites] = useState<Set<string>>(loadFavs)
   const [selectedPlace, setSelectedPlace] = useState<Place | null>(null)
@@ -916,25 +956,39 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
   const [stationLng, setStationLng] = useState<number | null>(null)
 
   useEffect(() => {
+    let active = true
     setSpotState('loading')
     fetchSpotPlaces(baseLat, baseLng, radiusM)
       .then(places => {
+        if (!active) return
         // Filter to places reachable within available time (round trip + 10 min)
         setSpots(places.filter(p => p.walkMin * 2 + 10 <= freeMin).slice(0, 15))
         setSpotState('done')
       })
-      .catch(() => setSpotState('error'))
-  }, [baseLat, baseLng, radiusM])
+      .catch(error => {
+        if (!active) return
+        console.error('スポットの検索に失敗しました', error)
+        setSpotState('error')
+      })
+    return () => { active = false }
+  }, [baseLat, baseLng, radiusM, freeMin, spotRetryCount])
 
   useEffect(() => {
+    let active = true
     setFoodState('loading')
     fetchFoodPlaces(baseLat, baseLng, radiusM)
       .then(places => {
+        if (!active) return
         setFoods(places.filter(p => p.walkMin <= maxWalkMin).slice(0, 15))
         setFoodState('done')
       })
-      .catch(() => setFoodState('error'))
-  }, [baseLat, baseLng, radiusM])
+      .catch(error => {
+        if (!active) return
+        console.error('飲食店の検索に失敗しました', error)
+        setFoodState('error')
+      })
+    return () => { active = false }
+  }, [baseLat, baseLng, radiusM, maxWalkMin, foodRetryCount])
 
   // Geocode station name once
   useEffect(() => {
@@ -1110,13 +1164,13 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
         <div className="flex-1 px-4 py-3 space-y-3 pb-10 overflow-y-auto">
           {activeTab === 'spots' && (
             spotState === 'loading' ? <Spinner /> :
-            spotState === 'error' ? <Empty message="データの取得に失敗しました。通信状況を確認してください" /> :
+            spotState === 'error' ? <Empty message="スポットの取得に失敗しました" onRetry={() => setSpotRetryCount(count => count + 1)} /> :
             spots.length === 0 ? <Empty message="このエリアでは候補を取得できませんでした" /> :
             spots.map(p => <PlaceCard key={p.id} place={p} isFav={favorites.has(p.id)} onToggleFav={() => toggleFav(p.id)} dark={dark} />)
           )}
           {activeTab === 'food' && (
             foodState === 'loading' ? <Spinner /> :
-            foodState === 'error' ? <Empty message="データの取得に失敗しました。通信状況を確認してください" /> :
+            foodState === 'error' ? <Empty message="飲食店の取得に失敗しました" onRetry={() => setFoodRetryCount(count => count + 1)} /> :
             foods.length === 0 ? <Empty message="このエリアでは候補を取得できませんでした" /> :
             foods.map(p => <PlaceCard key={p.id} place={p} isFav={favorites.has(p.id)} onToggleFav={() => toggleFav(p.id)} dark={dark} />)
           )}
