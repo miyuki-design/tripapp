@@ -36,10 +36,10 @@ jobs:
           pnpm exec cap add ios
           pnpm exec cap sync ios
 
-      - name: Build iOS simulator app
+            - name: Build iOS simulator app
         run: |
           xcodebuild \
-            -project ios/App/App.xcodeproj \
+            -workspace ios/App/App.xcworkspace \
             -scheme App \
             -configuration Debug \
             -sdk iphonesimulator \
