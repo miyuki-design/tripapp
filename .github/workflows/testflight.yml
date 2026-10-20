@@ -62,6 +62,19 @@ jobs:
           pnpm exec cap add ios
           pnpm exec cap sync ios
 
+      - name: Configure iOS location permission
+        run: |
+          set -euo pipefail
+
+          PLIST="ios/App/App/Info.plist"
+
+          /usr/libexec/PlistBuddy \
+            -c "Set :NSLocationWhenInUseUsageDescription 出張先や現在地周辺の寄り道スポットを探すために位置情報を使用します。" \
+            "$PLIST" 2>/dev/null || \
+          /usr/libexec/PlistBuddy \
+            -c "Add :NSLocationWhenInUseUsageDescription string 出張先や現在地周辺の寄り道スポットを探すために位置情報を使用します。" \
+            "$PLIST"
+
       - name: Install CocoaPods
         run: |
           cd ios/App
@@ -116,7 +129,8 @@ jobs:
 
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PATH" "$KEYCHAIN_PATH" 2>/dev/null || \
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           security import "$CERT_PATH" \
             -P "$DISTRIBUTION_P12_PASSWORD" \
