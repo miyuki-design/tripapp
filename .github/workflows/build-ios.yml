@@ -36,7 +36,26 @@ jobs:
           pnpm exec cap add ios
           pnpm exec cap sync ios
 
-            - name: Build iOS simulator app
+      - name: Install CocoaPods dependencies
+        run: |
+          cd ios/App
+          pod install --repo-update
+
+      - name: Check iOS project
+        run: |
+          echo "=== Xcode ==="
+          xcodebuild -version
+
+          echo "=== CocoaPods ==="
+          pod --version
+
+          echo "=== Workspace ==="
+          ls -la ios/App/
+
+          echo "=== Installed Pods ==="
+          ls -la ios/App/Pods/
+
+      - name: Build iOS simulator app
         run: |
           xcodebuild \
             -workspace ios/App/App.xcworkspace \
