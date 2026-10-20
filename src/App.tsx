@@ -1236,7 +1236,10 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
   )
 
   return (
-    <div className="min-h-screen flex flex-col" style={{ background: 'var(--background)' }}>
+    <div
+      className="flex flex-col overflow-hidden"
+      style={{ height: '100dvh', minHeight: 0, background: 'var(--background)' }}
+    >
       {/* Header */}
       <div style={{ background: 'var(--primary)' }} className="px-5 pt-12 pb-5">
         <div className="flex items-center justify-between mb-3">
@@ -1303,7 +1306,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
           </div>
 
           {/* Map canvas */}
-          <div className="flex-1 relative map-canvas">
+          <div className="flex-1 min-h-0 relative map-canvas">
             <MapView
               baseLat={baseLat} baseLng={baseLng}
               stationLat={stationLat} stationLng={stationLng} stationName={data.station}
