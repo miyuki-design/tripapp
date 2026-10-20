@@ -67,7 +67,7 @@ jobs:
           cd ios/App
           pod install
 
-       - name: Set TripApp iOS app icon
+      - name: Set TripApp iOS app icon
         run: |
           set -euo pipefail
 
