@@ -52,6 +52,12 @@ function formatMinutes(m: number): string {
   return rem === 0 ? `${h}時間` : `${h}時間${rem}分`
 }
 
+function escapeHtml(text: string): string {
+  return text.replace(/[&<>"']/g, ch => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string
+  ))
+}
+
 // Haversine distance in metres
 function distanceM(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371000
@@ -70,47 +76,72 @@ function walkMinutes(dist: number): number {
 
 // ── Overpass API ─────────────────────────────────────────────────────────────
 
-const OVERPASS_ENDPOINT = 'https://overpass-api.de/api/interpreter'
-const OVERPASS_RETRY_DELAYS_MS = [2000, 5000]
+// 公式Wikiに載っている公開インスタンス。先頭が遅い・失敗したら次のミラーも同時に走らせ、
+// 最初に成功した結果を使う（直列リトライで10秒以上待たされるのを避ける）。
+const OVERPASS_ENDPOINTS = [
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+]
+const OVERPASS_HEDGE_DELAY_MS = 2500      // 先頭がこの時間返さなければ次のミラーも起動
+const OVERPASS_ATTEMPT_TIMEOUT_MS = 12000 // 1リクエストの上限
 
-// Overpass is a shared service. Run one request at a time, including manual retries.
-let overpassQueue: Promise<void> = Promise.resolve()
-
-async function requestOverpassWithRetry(query: string): Promise<any[]> {
-  for (let attempt = 0; attempt <= OVERPASS_RETRY_DELAYS_MS.length; attempt++) {
-    try {
-      const res = await fetch(OVERPASS_ENDPOINT, {
-        method: 'POST',
-        body: `data=${encodeURIComponent(query)}`,
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      })
-      if (!res.ok) {
-        const error = new Error(`Overpass HTTP ${res.status}`)
-        // Bad requests, authorization errors, etc. will not improve with a retry.
-        if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
-          throw Object.assign(error, { nonRetryable: true })
-        }
-        throw error
-      }
-      const json = await res.json()
-      if (!Array.isArray(json.elements)) throw new Error('Overpass returned invalid data')
-      return json.elements
-    } catch (error) {
-      if ((error as { nonRetryable?: boolean })?.nonRetryable || attempt === OVERPASS_RETRY_DELAYS_MS.length) {
-        throw error
-      }
-      console.warn('Overpass: retrying after an error', error)
-      await new Promise<void>(resolve => setTimeout(resolve, OVERPASS_RETRY_DELAYS_MS[attempt]))
-    }
+async function requestOverpassOnce(endpoint: string, query: string, signal: AbortSignal): Promise<any[]> {
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    body: `data=${encodeURIComponent(query)}`,
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    signal,
+  })
+  if (!res.ok) throw new Error(`Overpass HTTP ${res.status}`)
+  const json = await res.json()
+  if (!Array.isArray(json.elements)) throw new Error('Overpass returned invalid data')
+  // タイムアウト等は HTTP 200 + remark で返ってくることがある。空結果として扱わず失敗にする。
+  if (typeof json.remark === 'string' && json.remark.includes('runtime error')) {
+    throw new Error(`Overpass ${json.remark}`)
   }
-  throw new Error('Overpass requests failed')
+  return json.elements
 }
 
 function fetchOverpass(query: string): Promise<any[]> {
-  const request = overpassQueue.then(() => requestOverpassWithRetry(query))
-  // Keep the queue usable even if one category's request fails.
-  overpassQueue = request.then(() => {}, () => {})
-  return request
+  return new Promise((resolve, reject) => {
+    const controllers: AbortController[] = []
+    const timers: number[] = []
+    const errors: unknown[] = []
+    let settled = false
+    let next = 0
+    let failures = 0
+
+    const finish = (done: () => void) => {
+      if (settled) return
+      settled = true
+      timers.forEach(window.clearTimeout)
+      controllers.forEach(c => c.abort()) // 負けた側のリクエストは打ち切る
+      done()
+    }
+
+    const startNext = () => {
+      if (settled || next >= OVERPASS_ENDPOINTS.length) return
+      const endpoint = OVERPASS_ENDPOINTS[next++]
+      const controller = new AbortController()
+      controllers.push(controller)
+      const timeout = window.setTimeout(() => controller.abort(), OVERPASS_ATTEMPT_TIMEOUT_MS)
+      timers.push(timeout)
+      requestOverpassOnce(endpoint, query, controller.signal)
+        .then(elements => finish(() => resolve(elements)))
+        .catch(error => {
+          window.clearTimeout(timeout)
+          if (settled) return
+          console.warn(`Overpass: ${endpoint} failed`, error)
+          errors.push(error)
+          failures++
+          if (next < OVERPASS_ENDPOINTS.length) startNext() // 失敗したら待たずに次のミラーへ
+          else if (failures >= OVERPASS_ENDPOINTS.length) finish(() => reject(errors[0]))
+        })
+    }
+
+    startNext()
+    timers.push(window.setTimeout(startNext, OVERPASS_HEDGE_DELAY_MS))
+  })
 }
 
 function elementCoord(el: any): { lat: number; lng: number } | null {
@@ -239,21 +270,24 @@ async function fetchAllPlaces(lat: number, lng: number, radiusM: number, refresh
   if (inflight) return inflight
 
   const request = (async (): Promise<SearchPlacesResult> => {
+    // 名前のない要素はどのみち捨てるので、サーバー側で先に除外して転送量・処理量を減らす。
+    // relation型の飲食店（restaurant / cafe / fast_food）も取得する。
+    const a = `(around:${radiusM},${lat},${lng})`
     const query = `
-[out:json][timeout:30];
+[out:json][timeout:25];
 (
-  node["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|ice_cream|bakery)$"](around:${radiusM},${lat},${lng});
-  way["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|bakery)$"](around:${radiusM},${lat},${lng});
-  relation["amenity"~"^(restaurant|cafe|fast_food)$"](around:${radiusM},${lat},${lng});
-  node["tourism"~"^(museum|gallery|viewpoint|zoo|aquarium|theme_park|artwork|hot_spring|attraction)$"](around:${radiusM},${lat},${lng});
-  node["historic"~"^(castle|castle_ruins|temple|shrine|monument|memorial|archaeological_site|ruins|building|wayside_shrine)$"](around:${radiusM},${lat},${lng});
-  node["leisure"~"^(park|garden|nature_reserve|sports_centre)$"](around:${radiusM},${lat},${lng});
-  node["natural"~"^(peak|waterfall|spring|cave_entrance|wood)$"](around:${radiusM},${lat},${lng});
-  way["tourism"~"^(museum|gallery|viewpoint|zoo|aquarium|theme_park|attraction|castle)$"](around:${radiusM},${lat},${lng});
-  way["historic"~"^(castle|castle_ruins|temple|shrine|ruins|archaeological_site)$"](around:${radiusM},${lat},${lng});
-  way["leisure"~"^(park|garden|nature_reserve)$"](around:${radiusM},${lat},${lng});
+  node["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|ice_cream|bakery)$"]["name"]${a};
+  way["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|bakery)$"]["name"]${a};
+  relation["amenity"~"^(restaurant|cafe|fast_food)$"]["name"]${a};
+  node["tourism"~"^(museum|gallery|viewpoint|zoo|aquarium|theme_park|artwork|hot_spring|attraction)$"]["name"]${a};
+  node["historic"~"^(castle|castle_ruins|temple|shrine|monument|memorial|archaeological_site|ruins|building|wayside_shrine)$"]["name"]${a};
+  node["leisure"~"^(park|garden|nature_reserve|sports_centre)$"]["name"]${a};
+  node["natural"~"^(peak|waterfall|spring|cave_entrance|wood)$"]["name"]${a};
+  way["tourism"~"^(museum|gallery|viewpoint|zoo|aquarium|theme_park|attraction|castle)$"]["name"]${a};
+  way["historic"~"^(castle|castle_ruins|temple|shrine|ruins|archaeological_site)$"]["name"]${a};
+  way["leisure"~"^(park|garden|nature_reserve)$"]["name"]${a};
 );
-out center tags;`
+out center tags qt;`
     const start = performance.now()
     const elements = await fetchOverpass(query)
     console.info(`出張ついで: スポット・グルメ取得 ${(performance.now() - start).toFixed(0)}ms`)
@@ -316,40 +350,96 @@ interface MapViewProps {
   selectedId: string | null
 }
 
-function MapView({ baseLat, baseLng, stationLat, stationLng, stationName, spots, foods, favorites, radiusM, onSelectPlace, selectedId }: MapViewProps) {
+// ── Map tiles ────────────────────────────────────────────────────────────────
+// OSM公式タイルサーバーは Referer が無いリクエストをブロックする。iOSアプリ(capacitor://)の
+// WebView からだと Referer が付かず、タイルが「Access blocked」や灰色になりやすい。
+// そこで国土地理院タイル(日本国内向け・キー不要)を第一候補にし、読み込めなければ CARTO へ自動で切り替える。
+const TILE_SOURCES: { url: string; options: L.TileLayerOptions }[] = [
+  {
+    url: 'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png',
+    options: {
+      maxZoom: 19, maxNativeZoom: 18,
+      attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank" rel="noopener noreferrer">地理院タイル</a>',
+    },
+  },
+  {
+    url: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+    options: { subdomains: 'abcd', maxZoom: 19, attribution: '© OpenStreetMap contributors © CARTO' },
+  },
+]
+
+function placeIcon(p: Place, isFav: boolean): L.DivIcon {
+  const bg = isFav ? '#c85c2e' : (p.kind === 'spot' ? '#1a2e4a' : '#2d6a4f')
+  const radius = p.kind === 'spot' ? '50%' : '10px'
+  return L.divIcon({
+    className: '',
+    html: `<div style="width:36px;height:36px;border-radius:${radius};background:${bg};border:2.5px solid white;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 8px rgba(0,0,0,0.3)">${p.emoji}</div>`,
+    iconSize: [36, 36], iconAnchor: [18, 18],
+  })
+}
+
+function MapView({ baseLat, baseLng, stationLat, stationLng, stationName, spots, foods, favorites, radiusM, onSelectPlace }: MapViewProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
-  const markersRef = useRef<Map<string, L.Marker>>(new Map())
-  const allPlaces = [...spots, ...foods]
+  const placesLayerRef = useRef<L.LayerGroup | null>(null)
+  const stationMarkerRef = useRef<L.Marker | null>(null)
+  const markersRef = useRef<Map<string, { marker: L.Marker; place: Place }>>(new Map())
+  const touchedRef = useRef(false) // ユーザーが地図を触ったら、自動で表示範囲を動かさない
 
-  // Rebuild marker icons when favorites change
-  const refreshMarkerIcons = useCallback((fav: Set<string>) => {
-    markersRef.current.forEach((marker, id) => {
-      const place = allPlaces.find(p => p.id === id)
-      if (!place) return
-      const isFav = fav.has(id)
-      const bg = isFav ? '#c85c2e' : (place.kind === 'spot' ? '#1a2e4a' : '#2d6a4f')
-      const radius = place.kind === 'spot' ? '50%' : '10px'
-      marker.setIcon(L.divIcon({
-        className: '',
-        html: `<div style="width:36px;height:36px;border-radius:${radius};background:${bg};border:2.5px solid white;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 8px rgba(0,0,0,0.3)">${place.emoji}</div>`,
-        iconSize: [36, 36], iconAnchor: [18, 18],
-      }))
-    })
-  }, [allPlaces])
+  // 非同期で後から変わる値（駅の座標、検索結果など）を、初回マウント時の古い値のまま掴まないよう ref 経由で参照する。
+  const latest = useRef({ baseLat, baseLng, stationLat, stationLng, spots, foods, onSelectPlace })
+  latest.current = { baseLat, baseLng, stationLat, stationLng, spots, foods, onSelectPlace }
+  const favoritesRef = useRef(favorites)
+  favoritesRef.current = favorites
 
+  const fitAll = useCallback(() => {
+    const map = mapRef.current
+    if (!map) return
+    const { baseLat, baseLng, stationLat, stationLng, spots, foods } = latest.current
+    const coords: L.LatLngTuple[] = [[baseLat, baseLng]]
+    // 駅が遠すぎる（誤検出など）と地図が引きすぎて使えないので、5km以内のときだけ表示範囲に含める
+    if (stationLat != null && stationLng != null && distanceM(baseLat, baseLng, stationLat, stationLng) <= 5000) {
+      coords.push([stationLat, stationLng])
+    }
+    for (const p of spots) coords.push([p.lat, p.lng])
+    for (const p of foods) coords.push([p.lat, p.lng])
+    if (coords.length > 1) map.fitBounds(L.latLngBounds(coords).pad(0.15), { animate: false })
+    else map.setView([baseLat, baseLng], 15, { animate: false })
+  }, [])
+
+  // 1) 地図本体は一度だけ作る
   useEffect(() => {
-    refreshMarkerIcons(favorites)
-  }, [favorites, refreshMarkerIcons])
-
-  useEffect(() => {
-    if (!containerRef.current || mapRef.current) return
-    const map = L.map(containerRef.current, { zoomControl: false, attributionControl: false }).setView([baseLat, baseLng], 15)
+    const container = containerRef.current
+    if (!container || mapRef.current) return
+    const { baseLat, baseLng, onSelectPlace } = latest.current
+    const map = L.map(container, { zoomControl: false, attributionControl: false }).setView([baseLat, baseLng], 15)
     mapRef.current = map
+    touchedRef.current = false
 
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map)
     L.control.zoom({ position: 'bottomright' }).addTo(map)
-    L.control.attribution({ prefix: '© OpenStreetMap' }).addTo(map)
+    // 帰属表示はタイルより先に追加する（タイル切替時に表示も追従させるため）
+    L.control.attribution({ prefix: false }).addTo(map)
+
+    // タイル。最初のソースが1枚も読めずエラーが続いたら次のソースへ切り替える。
+    let tileLayer: L.TileLayer | null = null
+    const useSource = (index: number) => {
+      if (tileLayer) map.removeLayer(tileLayer)
+      const src = TILE_SOURCES[index]
+      const layer = L.tileLayer(src.url, src.options)
+      let loaded = 0
+      let failed = 0
+      layer.on('tileload', () => { loaded++ })
+      layer.on('tileerror', () => {
+        failed++
+        if (loaded === 0 && failed >= 3 && index < TILE_SOURCES.length - 1) {
+          console.warn('出張ついで: 地図タイルを読み込めないため別のタイルに切り替えます', src.url)
+          useSource(index + 1)
+        }
+      })
+      layer.addTo(map)
+      tileLayer = layer
+    }
+    useSource(0)
 
     // Walking radius circle (subtle)
     L.circle([baseLat, baseLng], {
@@ -375,73 +465,90 @@ function MapView({ baseLat, baseLng, stationLat, stationLng, stationName, spots,
       zIndexOffset: 1000,
     }).addTo(map)
 
-    // Station pin
-    if (stationLat != null && stationLng != null) {
-      L.marker([stationLat, stationLng], {
-        icon: L.divIcon({
-          className: '',
-          html: `<div style="background:#1a2e4a;border:2.5px solid white;border-radius:8px;padding:3px 7px;font-size:11px;font-weight:700;color:white;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.3);font-family:'Noto Sans JP',sans-serif">🚉 ${stationName}</div>`,
-          iconAnchor: [0, 12],
-        }),
-        zIndexOffset: 900,
-      }).addTo(map)
-    }
-
-    // Place pins
-    const markers = new Map<string, L.Marker>()
-    const addPin = (p: Place) => {
-      const isFav = favorites.has(p.id)
-      const bg = isFav ? '#c85c2e' : (p.kind === 'spot' ? '#1a2e4a' : '#2d6a4f')
-      const radius = p.kind === 'spot' ? '50%' : '10px'
-      const icon = L.divIcon({
-        className: '',
-        html: `<div style="width:36px;height:36px;border-radius:${radius};background:${bg};border:2.5px solid white;display:flex;align-items:center;justify-content:center;font-size:18px;box-shadow:0 2px 8px rgba(0,0,0,0.3)">${p.emoji}</div>`,
-        iconSize: [36, 36], iconAnchor: [18, 18],
-      })
-      const marker = L.marker([p.lat, p.lng], { icon }).addTo(map)
-      marker.on('click', () => onSelectPlace(p))
-      markers.set(p.id, marker)
-    }
-    allPlaces.forEach(addPin)
-    markersRef.current = markers
-
-    // Fit bounds to all points
-    const coords: [number, number][] = [
-      [baseLat, baseLng],
-      ...(stationLat != null && stationLng != null ? [[stationLat, stationLng] as [number, number]] : []),
-      ...allPlaces.map(p => [p.lat, p.lng] as [number, number]),
-    ]
-    if (coords.length > 1) {
-      map.fitBounds(L.latLngBounds(coords).pad(0.15))
-    }
+    placesLayerRef.current = L.layerGroup().addTo(map)
 
     // Tap map background to deselect
     map.on('click', () => onSelectPlace(null))
 
-    // iOS WKWebView: wait until the map container has a real size.
-    // Recalculate when its layout changes (including tab transitions).
+    // 一度でも触ったら、後から届いた駅・検索結果で表示範囲を勝手に動かさない
+    const markTouched = () => { touchedRef.current = true }
+    container.addEventListener('pointerdown', markTouched, { passive: true })
+    container.addEventListener('wheel', markTouched, { passive: true })
+
+    // iOS WKWebView: コンテナに実寸が付いてから描画範囲を合わせる。
+    // 実寸ゼロの時に fitBounds すると世界地図のような縮尺になるため、最初に実寸が取れた時点で合わせ直す。
     let disposed = false
+    let sized = false
     let frame = 0
     const resizeMap = () => {
       if (disposed || !containerRef.current) return
       const { width, height } = containerRef.current.getBoundingClientRect()
-      if (width > 0 && height > 0) map.invalidateSize({ pan: false })
+      if (width <= 0 || height <= 0) return
+      map.invalidateSize({ pan: false })
+      if (!sized) {
+        sized = true
+        if (!touchedRef.current) fitAll()
+      }
     }
     const observer = new ResizeObserver(resizeMap)
-    observer.observe(containerRef.current)
+    observer.observe(container)
+    resizeMap()
     frame = requestAnimationFrame(resizeMap)
     const timers = [100, 350, 900].map(ms => window.setTimeout(resizeMap, ms))
 
     return () => {
       disposed = true
       observer.disconnect()
+      container.removeEventListener('pointerdown', markTouched)
+      container.removeEventListener('wheel', markTouched)
       cancelAnimationFrame(frame)
       timers.forEach(window.clearTimeout)
       map.remove()
       mapRef.current = null
+      placesLayerRef.current = null
+      stationMarkerRef.current = null
       markersRef.current = new Map()
     }
   }, [])
+
+  // 2) スポット・飲食店のピン。検索結果が変わったら作り直す（初回マウント時だけでなく再検索にも追従）
+  useEffect(() => {
+    const layer = placesLayerRef.current
+    if (!layer) return
+    layer.clearLayers()
+    const markers = new Map<string, { marker: L.Marker; place: Place }>()
+    for (const place of [...spots, ...foods]) {
+      const marker = L.marker([place.lat, place.lng], { icon: placeIcon(place, favoritesRef.current.has(place.id)) })
+      marker.on('click', () => latest.current.onSelectPlace(place))
+      layer.addLayer(marker)
+      markers.set(place.id, { marker, place })
+    }
+    markersRef.current = markers
+    if (!touchedRef.current) fitAll()
+  }, [spots, foods, fitAll])
+
+  // 3) お気に入りの切り替え時は、色が変わるピンのアイコンだけ差し替える（描画のたびに全ピンを作り直さない）
+  useEffect(() => {
+    markersRef.current.forEach(({ marker, place }, id) => marker.setIcon(placeIcon(place, favorites.has(id))))
+  }, [favorites])
+
+  // 4) 駅ピン。駅の座標は非同期で後から届くので、届いた時点で追加する
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
+    stationMarkerRef.current?.remove()
+    stationMarkerRef.current = null
+    if (stationLat == null || stationLng == null) return
+    stationMarkerRef.current = L.marker([stationLat, stationLng], {
+      icon: L.divIcon({
+        className: '',
+        html: `<div style="background:#1a2e4a;border:2.5px solid white;border-radius:8px;padding:3px 7px;font-size:11px;font-weight:700;color:white;white-space:nowrap;box-shadow:0 2px 8px rgba(0,0,0,0.3);font-family:'Noto Sans JP',sans-serif">🚉 ${escapeHtml(stationName)}</div>`,
+        iconAnchor: [0, 12],
+      }),
+      zIndexOffset: 900,
+    }).addTo(map)
+    if (!touchedRef.current) fitAll()
+  }, [stationLat, stationLng, stationName, fitAll])
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
 }
@@ -574,6 +681,29 @@ async function searchLocations(query: string, signal?: AbortSignal): Promise<Loc
   })
 }
 
+// 駅名 → 座標。出張先の近くを優先し(lat/lon)、鉄道駅に絞る。見つからなければ従来のNominatimへ。
+async function geocodeStation(name: string, nearLat: number, nearLng: number, signal: AbortSignal): Promise<{ lat: number; lng: number } | null> {
+  try {
+    const params = new URLSearchParams({
+      q: name.trim(), lang: 'default', limit: '1',
+      lat: String(nearLat), lon: String(nearLng), osm_tag: 'railway:station',
+    })
+    const res = await fetch(`https://photon.komoot.io/api/?${params.toString()}`, { signal })
+    if (res.ok) {
+      const coords = (await res.json()).features?.[0]?.geometry?.coordinates
+      if (Array.isArray(coords) && Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1]))) {
+        return { lat: Number(coords[1]), lng: Number(coords[0]) }
+      }
+    }
+  } catch {
+    if (signal.aborted) return null
+  }
+  const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(name)}&format=json&limit=1&accept-language=ja&countrycodes=jp`, { signal })
+  if (!res.ok) return null
+  const first = (await res.json())[0]
+  return first ? { lat: parseFloat(first.lat), lng: parseFloat(first.lon) } : null
+}
+
 // ── Input Page ────────────────────────────────────────────────────────────────
 
 function InputPage({ onSubmit, dark, onToggleDark }: {
@@ -627,7 +757,7 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
       } finally {
         if (active) setLocationSearching(false)
       }
-    }, 650)
+    }, 300)
     return () => {
       active = false
       window.clearTimeout(timer)
@@ -767,7 +897,9 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
       setLocationResolving(true)
       setErrors(prev => ({ ...prev, location: '' }))
       try {
-        const matches = await searchLocations(location)
+        // 入力変更時に候補は破棄されるので、残っている候補は今の入力文字列に対するもの。
+        // それがあれば再検索せず使う（Photonへの往復を1回省く）。
+        const matches = locationOptions.length > 0 ? locationOptions : await searchLocations(location)
         if (requestId !== locationChangeRef.current) return
         if (!matches.length) {
           setErrors(prev => ({ ...prev, location: '場所を特定できませんでした。住所や駅名を詳しく入力してください' }))
@@ -1063,16 +1195,17 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
     return () => { active = false }
   }, [baseLat, baseLng, radiusM, freeMin, maxWalkMin, retryCount])
 
-  // Geocode station name once
+  // Geocode station name once（スポット検索とは独立して並行実行。失敗しても駅ピンが出ないだけ）
   useEffect(() => {
     if (!data.station) return
-    fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(data.station)}&format=json&limit=1&accept-language=ja&countrycodes=jp`)
-      .then(r => r.json())
-      .then(results => {
-        if (results[0]) { setStationLat(parseFloat(results[0].lat)); setStationLng(parseFloat(results[0].lon)) }
+    const controller = new AbortController()
+    geocodeStation(data.station, baseLat, baseLng, controller.signal)
+      .then(result => {
+        if (result && !controller.signal.aborted) { setStationLat(result.lat); setStationLng(result.lng) }
       })
       .catch(() => {})
-  }, [data.station])
+    return () => controller.abort()
+  }, [data.station, baseLat, baseLng])
 
   const toggleFav = useCallback((id: string) => {
     setFavorites(prev => {
@@ -1170,7 +1303,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
           </div>
 
           {/* Map canvas */}
-          <div className="flex-1 relative" style={{ minHeight: 320, height: 'calc(100vh - 280px)' }}>
+          <div className="flex-1 relative map-canvas">
             <MapView
               baseLat={baseLat} baseLng={baseLng}
               stationLat={stationLat} stationLng={stationLng} stationName={data.station}
