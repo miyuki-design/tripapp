@@ -629,6 +629,7 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
       setGpsError('この端末は位置情報の取得に対応していません。手動で入力してください')
       return
     }
+
     const requestId = ++locationChangeRef.current
     setGpsLoading(true)
     setGpsError('')
@@ -638,9 +639,27 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
     setLocationLng(null)
     setLocationSource('gps')
 
+    // iOSのWebViewで位置情報のコールバックが戻らない場合にも画面を解除する。
+    let settled = false
+    const watchdog = window.setTimeout(() => {
+      if (settled || requestId !== locationChangeRef.current) return
+      settled = true
+      setGpsLoading(false)
+      setLocationSource(null)
+      setGpsError('位置情報の取得がタイムアウトしました。位置情報の許可を確認するか、手動で入力してください')
+    }, 15000)
+
+    const finish = () => {
+      if (settled || requestId !== locationChangeRef.current) return false
+      settled = true
+      window.clearTimeout(watchdog)
+      setGpsLoading(false)
+      return true
+    }
+
     navigator.geolocation.getCurrentPosition(
-      async pos => {
-        if (requestId !== locationChangeRef.current) return
+      pos => {
+        if (!finish()) return
         const lat = pos.coords.latitude
         const lng = pos.coords.longitude
         const fallback = `${lat.toFixed(5)}, ${lng.toFixed(5)}`
@@ -648,30 +667,34 @@ function InputPage({ onSubmit, dark, onToggleDark }: {
         setLocationLng(lng)
         setLocation(fallback)
         setErrors(prev => ({ ...prev, location: '' }))
-        // 逆ジオコーディングはGPSボタン押下時の1回のみ。
-        try {
-          const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=ja`
-          const response = await fetch(url)
-          if (!response.ok) throw new Error('逆ジオコーディング失敗')
-          const data = await response.json()
-          if (requestId !== locationChangeRef.current) return
-          const a = data.address ?? {}
-          const parts = [
-            a.road || a.suburb || a.neighbourhood || a.quarter || a.city_district,
-            a.city || a.town || a.village || a.hamlet || a.municipality || a.county,
-            a.state,
-          ].filter(Boolean)
-          setLocation([...new Set(parts)].join('、') || fallback)
-        } catch {
-          // 住所表示が取得できなくてもGPS座標自体は有効。
-          if (requestId === locationChangeRef.current) setLocation(fallback)
-        } finally {
-          if (requestId === locationChangeRef.current) setGpsLoading(false)
-        }
+
+        // 住所への変換は表示用。通信が遅くてもGPS取得完了を妨げない。
+        const controller = new AbortController()
+        const reverseTimeout = window.setTimeout(() => controller.abort(), 5000)
+        void (async () => {
+          try {
+            const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&accept-language=ja`
+            const response = await fetch(url, { signal: controller.signal })
+            if (!response.ok) return
+            const data = await response.json()
+            if (requestId !== locationChangeRef.current) return
+            const a = data.address ?? {}
+            const parts = [
+              a.road || a.suburb || a.neighbourhood || a.quarter || a.city_district,
+              a.city || a.town || a.village || a.hamlet || a.municipality || a.county,
+              a.state,
+            ].filter(Boolean)
+            const label = [...new Set(parts)].join('、')
+            if (label) setLocation(label)
+          } catch {
+            // GPS座標は取得済みなので住所変換エラーは無視する。
+          } finally {
+            window.clearTimeout(reverseTimeout)
+          }
+        })()
       },
       err => {
-        if (requestId !== locationChangeRef.current) return
-        setGpsLoading(false)
+        if (!finish()) return
         setLocationSource(null)
         setGpsError(err.code === 1
           ? '位置情報が許可されていません。設定で許可するか、手動で入力してください'
