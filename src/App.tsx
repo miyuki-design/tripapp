@@ -195,43 +195,56 @@ function spotSubtitle(tags: Record<string, string>): string {
   return parts.join(' ／ ')
 }
 
-async function fetchFoodPlaces(lat: number, lng: number, radiusM: number): Promise<Place[]> {
-  const query = `
+// One Overpass request retrieves both categories, avoiding two server waits.
+// Keep the same category filters, sorting and place IDs as before.
+const FOOD_NODE = /^(restaurant|cafe|fast_food|bar|pub|food_court|ice_cream|bakery)$/
+const FOOD_WAY = /^(restaurant|cafe|fast_food|bar|pub|food_court|bakery)$/
+const FOOD_REL = /^(restaurant|cafe|fast_food)$/
+const SPOT_TOURISM_NODE = /^(museum|gallery|viewpoint|zoo|aquarium|theme_park|artwork|hot_spring|attraction)$/
+const SPOT_HISTORIC_NODE = /^(castle|castle_ruins|temple|shrine|monument|memorial|archaeological_site|ruins|building|wayside_shrine)$/
+const SPOT_LEISURE_NODE = /^(park|garden|nature_reserve|sports_centre)$/
+const SPOT_NATURAL_NODE = /^(peak|waterfall|spring|cave_entrance|wood)$/
+const SPOT_TOURISM_WAY = /^(museum|gallery|viewpoint|zoo|aquarium|theme_park|attraction|castle)$/
+const SPOT_HISTORIC_WAY = /^(castle|castle_ruins|temple|shrine|ruins|archaeological_site)$/
+const SPOT_LEISURE_WAY = /^(park|garden|nature_reserve)$/
+
+function matchesFood(type: string, tags: Record<string, string>): boolean {
+  const amenity = tags.amenity ?? ''
+  return type === 'node' ? FOOD_NODE.test(amenity)
+    : type === 'way' ? FOOD_WAY.test(amenity)
+    : type === 'relation' ? FOOD_REL.test(amenity) : false
+}
+
+function matchesSpot(type: string, tags: Record<string, string>): boolean {
+  if (type === 'node') return SPOT_TOURISM_NODE.test(tags.tourism ?? '') ||
+    SPOT_HISTORIC_NODE.test(tags.historic ?? '') ||
+    SPOT_LEISURE_NODE.test(tags.leisure ?? '') ||
+    SPOT_NATURAL_NODE.test(tags.natural ?? '')
+  if (type === 'way') return SPOT_TOURISM_WAY.test(tags.tourism ?? '') ||
+    SPOT_HISTORIC_WAY.test(tags.historic ?? '') ||
+    SPOT_LEISURE_WAY.test(tags.leisure ?? '')
+  return false
+}
+
+type SearchPlacesResult = { spots: Place[]; foods: Place[] }
+const SEARCH_CACHE_MS = 5 * 60 * 1000
+const placeCache = new Map<string, { time: number; data: SearchPlacesResult }>()
+const placeInFlight = new Map<string, Promise<SearchPlacesResult>>()
+
+async function fetchAllPlaces(lat: number, lng: number, radiusM: number, refresh = false): Promise<SearchPlacesResult> {
+  const key = `${lat.toFixed(5)},${lng.toFixed(5)},${radiusM}`
+  const cached = placeCache.get(key)
+  if (!refresh && cached && Date.now() - cached.time < SEARCH_CACHE_MS) return cached.data
+  const inflight = placeInFlight.get(key)
+  if (inflight) return inflight
+
+  const request = (async (): Promise<SearchPlacesResult> => {
+    const query = `
 [out:json][timeout:30];
 (
   node["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|ice_cream|bakery)$"](around:${radiusM},${lat},${lng});
   way["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|bakery)$"](around:${radiusM},${lat},${lng});
   relation["amenity"~"^(restaurant|cafe|fast_food)$"](around:${radiusM},${lat},${lng});
-);
-out center tags;`
-  const elements = await fetchOverpass(query)
-  const results: Place[] = []
-  for (const el of elements) {
-    const tags: Record<string, string> = el.tags ?? {}
-    const name = nameOf(tags)
-    if (!name) continue
-    const coord = elementCoord(el)
-    if (!coord) continue
-    const dist = distanceM(lat, lng, coord.lat, coord.lng)
-    results.push({
-      id: `f_${el.type}_${el.id}`,
-      name,
-      emoji: foodEmoji(tags),
-      walkMin: walkMinutes(dist),
-      lat: coord.lat,
-      lng: coord.lng,
-      tags,
-      kind: 'food',
-      subtitle: foodSubtitle(tags),
-    })
-  }
-  return results.sort((a, b) => a.walkMin - b.walkMin)
-}
-
-async function fetchSpotPlaces(lat: number, lng: number, radiusM: number): Promise<Place[]> {
-  const query = `
-[out:json][timeout:30];
-(
   node["tourism"~"^(museum|gallery|viewpoint|zoo|aquarium|theme_park|artwork|hot_spring|attraction)$"](around:${radiusM},${lat},${lng});
   node["historic"~"^(castle|castle_ruins|temple|shrine|monument|memorial|archaeological_site|ruins|building|wayside_shrine)$"](around:${radiusM},${lat},${lng});
   node["leisure"~"^(park|garden|nature_reserve|sports_centre)$"](around:${radiusM},${lat},${lng});
@@ -241,28 +254,34 @@ async function fetchSpotPlaces(lat: number, lng: number, radiusM: number): Promi
   way["leisure"~"^(park|garden|nature_reserve)$"](around:${radiusM},${lat},${lng});
 );
 out center tags;`
-  const elements = await fetchOverpass(query)
-  const results: Place[] = []
-  for (const el of elements) {
-    const tags: Record<string, string> = el.tags ?? {}
-    const name = nameOf(tags)
-    if (!name) continue
-    const coord = elementCoord(el)
-    if (!coord) continue
-    const dist = distanceM(lat, lng, coord.lat, coord.lng)
-    results.push({
-      id: `s_${el.type}_${el.id}`,
-      name,
-      emoji: spotEmoji(tags),
-      walkMin: walkMinutes(dist),
-      lat: coord.lat,
-      lng: coord.lng,
-      tags,
-      kind: 'spot',
-      subtitle: spotSubtitle(tags),
-    })
-  }
-  return results.sort((a, b) => a.walkMin - b.walkMin)
+    const start = performance.now()
+    const elements = await fetchOverpass(query)
+    console.info(`出張ついで: スポット・グルメ取得 ${(performance.now() - start).toFixed(0)}ms`)
+    const result: SearchPlacesResult = { spots: [], foods: [] }
+    for (const el of elements) {
+      const tags: Record<string, string> = el.tags ?? {}
+      const name = nameOf(tags)
+      const coord = elementCoord(el)
+      if (!name || !coord) continue
+      const walkMin = walkMinutes(distanceM(lat, lng, coord.lat, coord.lng))
+      if (matchesFood(el.type, tags)) result.foods.push({
+        id: `f_${el.type}_${el.id}`, name, emoji: foodEmoji(tags), walkMin,
+        lat: coord.lat, lng: coord.lng, tags, kind: 'food', subtitle: foodSubtitle(tags),
+      })
+      if (matchesSpot(el.type, tags)) result.spots.push({
+        id: `s_${el.type}_${el.id}`, name, emoji: spotEmoji(tags), walkMin,
+        lat: coord.lat, lng: coord.lng, tags, kind: 'spot', subtitle: spotSubtitle(tags),
+      })
+    }
+    result.foods.sort((a, b) => a.walkMin - b.walkMin)
+    result.spots.sort((a, b) => a.walkMin - b.walkMin)
+    if (placeCache.size >= 25) placeCache.delete(placeCache.keys().next().value!)
+    placeCache.set(key, { time: Date.now(), data: result })
+    return result
+  })()
+  placeInFlight.set(key, request)
+  try { return await request }
+  finally { placeInFlight.delete(key) }
 }
 
 // ── Favorites ─────────────────────────────────────────────────────────────────
@@ -498,7 +517,7 @@ function Empty({ message, onRetry }: { message: string; onRetry?: () => void }) 
       {onRetry && (
         <button type="button" onClick={onRetry} className="mt-5 px-5 py-2.5 rounded-xl text-sm font-semibold active:scale-95"
           style={{ background: 'var(--secondary)', color: 'var(--secondary-foreground)', border: '1.5px solid var(--border)' }}>
-          🔄 この項目だけ再検索
+          🔄 スポット・食事を再検索
         </button>
       )}
     </div>
@@ -996,8 +1015,7 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
   const [foods, setFoods] = useState<Place[]>([])
   const [spotState, setSpotState] = useState<FetchState>('idle')
   const [foodState, setFoodState] = useState<FetchState>('idle')
-  const [spotRetryCount, setSpotRetryCount] = useState(0)
-  const [foodRetryCount, setFoodRetryCount] = useState(0)
+  const [retryCount, setRetryCount] = useState(0)
   const [activeTab, setActiveTab] = useState<'spots' | 'food' | 'map' | 'favs'>('spots')
   const [favorites, setFavorites] = useState<Set<string>>(loadFavs)
   const [selectedPlace, setSelectedPlace] = useState<Place | null>(null)
@@ -1007,37 +1025,24 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
   useEffect(() => {
     let active = true
     setSpotState('loading')
-    fetchSpotPlaces(baseLat, baseLng, radiusM)
-      .then(places => {
-        if (!active) return
-        // Filter to places reachable within available time (round trip + 10 min)
-        setSpots(places.filter(p => p.walkMin * 2 + 10 <= freeMin).slice(0, 15))
-        setSpotState('done')
-      })
-      .catch(error => {
-        if (!active) return
-        console.error('スポットの検索に失敗しました', error)
-        setSpotState('error')
-      })
-    return () => { active = false }
-  }, [baseLat, baseLng, radiusM, freeMin, spotRetryCount])
-
-  useEffect(() => {
-    let active = true
     setFoodState('loading')
-    fetchFoodPlaces(baseLat, baseLng, radiusM)
-      .then(places => {
+    // Initial load uses one shared API request. Explicit retry bypasses the cache.
+    fetchAllPlaces(baseLat, baseLng, radiusM, retryCount > 0)
+      .then(({ spots: spotPlaces, foods: foodPlaces }) => {
         if (!active) return
-        setFoods(places.filter(p => p.walkMin <= maxWalkMin).slice(0, 15))
+        setSpots(spotPlaces.filter(p => p.walkMin * 2 + 10 <= freeMin).slice(0, 15))
+        setFoods(foodPlaces.filter(p => p.walkMin <= maxWalkMin).slice(0, 15))
+        setSpotState('done')
         setFoodState('done')
       })
       .catch(error => {
         if (!active) return
-        console.error('飲食店の検索に失敗しました', error)
+        console.error('スポット・飲食店の検索に失敗しました', error)
+        setSpotState('error')
         setFoodState('error')
       })
     return () => { active = false }
-  }, [baseLat, baseLng, radiusM, maxWalkMin, foodRetryCount])
+  }, [baseLat, baseLng, radiusM, freeMin, maxWalkMin, retryCount])
 
   // Geocode station name once
   useEffect(() => {
@@ -1214,13 +1219,13 @@ function ResultsPage({ data, onBack, dark, onToggleDark }: {
         <div className="flex-1 px-4 py-3 space-y-3 pb-10 overflow-y-auto">
           {activeTab === 'spots' && (
             spotState === 'loading' ? <Spinner /> :
-            spotState === 'error' ? <Empty message="スポットの取得に失敗しました" onRetry={() => setSpotRetryCount(count => count + 1)} /> :
+            spotState === 'error' ? <Empty message="スポットの取得に失敗しました" onRetry={() => setRetryCount(count => count + 1)} /> :
             spots.length === 0 ? <Empty message="このエリアでは候補を取得できませんでした" /> :
             spots.map(p => <PlaceCard key={p.id} place={p} isFav={favorites.has(p.id)} onToggleFav={() => toggleFav(p.id)} dark={dark} />)
           )}
           {activeTab === 'food' && (
             foodState === 'loading' ? <Spinner /> :
-            foodState === 'error' ? <Empty message="飲食店の取得に失敗しました" onRetry={() => setFoodRetryCount(count => count + 1)} /> :
+            foodState === 'error' ? <Empty message="飲食店の取得に失敗しました" onRetry={() => setRetryCount(count => count + 1)} /> :
             foods.length === 0 ? <Empty message="このエリアでは候補を取得できませんでした" /> :
             foods.map(p => <PlaceCard key={p.id} place={p} isFav={favorites.has(p.id)} onToggleFav={() => toggleFav(p.id)} dark={dark} />)
           )}
