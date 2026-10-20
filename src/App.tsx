@@ -418,10 +418,29 @@ function MapView({ baseLat, baseLng, stationLat, stationLng, stationName, spots,
     // Tap map background to deselect
     map.on('click', () => onSelectPlace(null))
 
-    // Ensure Leaflet recalculates size after layout settles
-    setTimeout(() => map.invalidateSize(), 50)
+    // iOS WKWebView: wait until the map container has a real size.
+    // Recalculate when its layout changes (including tab transitions).
+    let disposed = false
+    let frame = 0
+    const resizeMap = () => {
+      if (disposed || !containerRef.current) return
+      const { width, height } = containerRef.current.getBoundingClientRect()
+      if (width > 0 && height > 0) map.invalidateSize({ pan: false })
+    }
+    const observer = new ResizeObserver(resizeMap)
+    observer.observe(containerRef.current)
+    frame = requestAnimationFrame(resizeMap)
+    const timers = [100, 350, 900].map(ms => window.setTimeout(resizeMap, ms))
 
-    return () => { map.remove(); mapRef.current = null; markersRef.current = new Map() }
+    return () => {
+      disposed = true
+      observer.disconnect()
+      cancelAnimationFrame(frame)
+      timers.forEach(window.clearTimeout)
+      map.remove()
+      mapRef.current = null
+      markersRef.current = new Map()
+    }
   }, [])
 
   return <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
