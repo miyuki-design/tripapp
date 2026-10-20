@@ -278,7 +278,6 @@ async function fetchAllPlaces(lat: number, lng: number, radiusM: number, refresh
 (
   node["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|ice_cream|bakery)$"]["name"]${a};
   way["amenity"~"^(restaurant|cafe|fast_food|bar|pub|food_court|bakery)$"]["name"]${a};
-  relation["amenity"~"^(restaurant|cafe|fast_food)$"]["name"]${a};
   node["tourism"~"^(museum|gallery|viewpoint|zoo|aquarium|theme_park|artwork|hot_spring|attraction)$"]["name"]${a};
   node["historic"~"^(castle|castle_ruins|temple|shrine|monument|memorial|archaeological_site|ruins|building|wayside_shrine)$"]["name"]${a};
   node["leisure"~"^(park|garden|nature_reserve|sports_centre)$"]["name"]${a};
